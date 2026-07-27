@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: sb-groupchat-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      # Set these in the Render dashboard (Environment tab). sync: false keeps
+      # secrets out of this file and out of git.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GCS_BUCKET
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
+      # Gemini retires models regularly (gemini-2.0-flash was shut down
+      # 2026-06-01). Override here without touching code when that happens.
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash-lite
+      # Which timezone "today" means for /summary and /export. Cambodia = 7.
+      - key: LOCAL_UTC_OFFSET_HOURS
+        value: "7"
+      # Path where the Render Secret File is mounted. Upload the Firebase
+      # service account JSON as a Secret File with this exact filename.
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/gcp-service-account.json

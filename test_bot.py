@@ -23,7 +23,6 @@ from unittest import mock
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:TESTTOKEN")
 os.environ.setdefault("WEBHOOK_SECRET", "testsecret")
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
-os.environ.setdefault("GCS_BUCKET", "test-bucket")
 os.environ.setdefault("LOCAL_UTC_OFFSET_HOURS", "7")
 
 DAILY_LIMITS = {"ask": 20, "summary": 5, "export": 3, "voice": 15}
@@ -55,8 +54,6 @@ def _install_stubs():
     fake_db.log_message = lambda *a, **k: logged_messages.append((a, k))
     fake_db.save_transcript = lambda g, m, t: saved_transcripts.append((g, m, t))
     fake_db.get_messages_in_range = lambda group_id, start, end: []
-    fake_db.upload_voice = lambda g, m, data: f"{g}/{m}.ogg"
-    fake_db.download_voice = lambda path: b"fake-ogg-bytes"
     fake_db.cleanup_old_messages = lambda: 0
     fake_db.check_group_voice_limit = lambda group_id: True
     fake_db.increment_group_voice = lambda g: group_voice_increments.append(g)
@@ -121,6 +118,20 @@ async def fake_get_chat_member(self, chat_id, user_id, *args, **kwargs):
     return member
 
 
+get_file_calls = []
+
+
+async def fake_get_file(self, file_id, *args, **kwargs):
+    """Stand in for fetching voice audio back from Telegram by file_id."""
+    get_file_calls.append(file_id)
+
+    class _File:
+        async def download_as_bytearray(self):
+            return bytearray(b"fake-ogg-bytes")
+
+    return _File()
+
+
 # Started at import time and deliberately never stopped: bot.py calls
 # Application.initialize() at module load, so the patches must already be live.
 for target, replacement in [
@@ -128,6 +139,7 @@ for target, replacement in [
     ("send_message", fake_send_message),
     ("send_document", fake_send_document),
     ("get_chat_member", fake_get_chat_member),
+    ("get_file", fake_get_file),
 ]:
     mock.patch.object(ExtBot, target, replacement).start()
 mock.patch.object(HTTPXRequest, "initialize", fake_request_initialize).start()
@@ -137,6 +149,11 @@ import bot  # noqa: E402
 
 GROUP_ID = -1001234567890
 USER_ID = 42
+
+
+def tg_bot():
+    """The live ExtBot instance, so patched get_file/send_message apply."""
+    return bot.tg_app.bot
 
 
 def make_update(update_id, text, chat_type="group"):
@@ -255,50 +272,82 @@ class PeriodRangeTest(unittest.TestCase):
 
 class VoiceLimitTest(unittest.TestCase):
     """The gap in the original build: transcription must consult both the
-    per-user and the group-wide voice caps, not just /summary and /export."""
+    per-user and the group-wide voice caps, not just /summary and /export.
+
+    Also covers fetching audio back from Telegram by file_id, since we store no
+    audio ourselves.
+    """
 
     def setUp(self):
         transcribe_calls.clear()
         saved_transcripts.clear()
         group_voice_increments.clear()
+        get_file_calls.clear()
+
+    def _run(self, message):
+        # Driven on the application's own loop, the same one the webhook route
+        # uses -- not a throwaway asyncio.run() loop.
+        return bot._loop.run_until_complete(
+            bot._transcribe_voice_msg(tg_bot(), GROUP_ID, message, USER_ID)
+        )
 
     def test_cached_transcript_is_not_resent_to_gemini(self):
-        message = {"message_id": 1, "transcript": "already done", "audio_path": "g/1.ogg"}
-        result = bot._transcribe_voice_msg(GROUP_ID, message, USER_ID)
-        self.assertEqual(result, "already done")
+        message = {"message_id": 1, "transcript": "already done", "file_id": "AwACF1"}
+        self.assertEqual(self._run(message), "already done")
         self.assertEqual(transcribe_calls, [])
+        self.assertEqual(get_file_calls, [], "must not even ask Telegram for audio")
 
-    def test_transcribes_and_caches(self):
-        message = {"message_id": 2, "transcript": None, "audio_path": "g/2.ogg"}
-        result = bot._transcribe_voice_msg(GROUP_ID, message, USER_ID)
+    def test_fetches_from_telegram_then_transcribes_and_caches(self):
+        message = {"message_id": 2, "transcript": None, "file_id": "AwACF2"}
+        result = self._run(message)
         self.assertEqual(result, "The rebar delivery arrives Thursday.")
+        self.assertEqual(get_file_calls, ["AwACF2"])
         self.assertEqual(len(transcribe_calls), 1)
         self.assertEqual(saved_transcripts, [(GROUP_ID, 2, result)])
         self.assertEqual(group_voice_increments, [GROUP_ID])
 
+    def test_missing_file_id_is_reported_not_crashed(self):
+        message = {"message_id": 3, "transcript": None, "file_id": None}
+        self.assertIn("unavailable", self._run(message))
+        self.assertEqual(get_file_calls, [])
+
     def test_group_backstop_blocks_before_calling_gemini(self):
         with mock.patch.object(fake_db, "check_group_voice_limit", lambda g: False):
-            message = {"message_id": 3, "transcript": None, "audio_path": "g/3.ogg"}
-            result = bot._transcribe_voice_msg(GROUP_ID, message, USER_ID)
+            message = {"message_id": 4, "transcript": None, "file_id": "AwACF4"}
+            result = self._run(message)
         self.assertIn("limit reached", result)
         self.assertEqual(transcribe_calls, [])
+        self.assertEqual(get_file_calls, [], "must not download before checking caps")
 
     def test_per_user_voice_limit_blocks_before_calling_gemini(self):
         with mock.patch.object(
             fake_db, "check_and_increment", lambda g, u, kind: kind != "voice"
         ):
-            message = {"message_id": 4, "transcript": None, "audio_path": "g/4.ogg"}
-            result = bot._transcribe_voice_msg(GROUP_ID, message, USER_ID)
+            message = {"message_id": 5, "transcript": None, "file_id": "AwACF5"}
+            result = self._run(message)
         self.assertIn("limit reached", result)
         self.assertEqual(transcribe_calls, [])
+        self.assertEqual(get_file_calls, [])
 
     def test_failed_transcription_does_not_charge_the_group(self):
         def boom(audio):
             raise RuntimeError("gemini down")
 
         with mock.patch.object(fake_gemini, "transcribe_and_translate", boom):
-            message = {"message_id": 5, "transcript": None, "audio_path": "g/5.ogg"}
-            result = bot._transcribe_voice_msg(GROUP_ID, message, USER_ID)
+            message = {"message_id": 6, "transcript": None, "file_id": "AwACF6"}
+            result = self._run(message)
+        self.assertIn("failed", result)
+        self.assertEqual(group_voice_increments, [])
+
+    def test_deleted_voice_message_degrades_gracefully(self):
+        """If the sender deleted the note, Telegram stops serving it."""
+
+        async def gone(self, file_id, *args, **kwargs):
+            raise RuntimeError("Bad Request: file is temporarily unavailable")
+
+        with mock.patch.object(ExtBot, "get_file", gone):
+            message = {"message_id": 7, "transcript": None, "file_id": "AwACF7"}
+            result = self._run(message)
         self.assertIn("failed", result)
         self.assertEqual(group_voice_increments, [])
 

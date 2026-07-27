@@ -7,8 +7,8 @@ It quietly logs group messages for 10 days, answers questions, and on request
 sends you a private recap or a full text export — including voice notes, which
 it transcribes and translates to English.
 
-Everything runs on free tiers: Render + Firebase (Firestore + Storage) + the
-Gemini API.
+Everything runs on genuinely free tiers, with no billing account anywhere:
+Render + Firebase Firestore + the Gemini API.
 
 ## Commands
 
@@ -42,16 +42,26 @@ transcribed once — the text is saved, so the same note never costs quota twice
 
 ## How voice notes work
 
-1. Someone sends a voice note. The bot silently saves the audio file. **No AI is
-   used at this point** and nothing is posted in the chat.
+1. Someone sends a voice note. The bot notes down a reference to it and nothing
+   else. **No AI is used, no audio is copied**, and nothing is posted in the chat.
 2. Notes longer than **3 minutes** are ignored completely.
-3. The first time a `/summary` or `/export` covers that note, it is transcribed,
-   translated to English if needed, and the text is saved for next time.
+3. The first time a `/summary` or `/export` covers that note, the bot fetches the
+   audio back from Telegram, transcribes it, translates it to English if needed,
+   and saves the text for next time.
+
+The audio itself is never stored by this bot — it stays where your team already
+sent it, on Telegram's servers. That keeps the whole project on free plans and
+means there's no second copy of your site conversations sitting in a cloud
+bucket.
+
+One consequence: if someone **deletes** their voice message in Telegram, a later
+summary can't transcribe it and will show `[voice transcription failed]`. Notes
+already transcribed are unaffected, since the text is saved.
 
 ## Data retention
 
-Messages, transcripts and audio files are deleted after **10 days**. A daily
-cleanup job does this (step 7 below).
+Messages and transcripts are deleted after **10 days** by a daily cleanup job
+(step 7 below). After that the bot has no record of the conversation at all.
 
 ---
 
@@ -64,7 +74,6 @@ You will collect six values along the way. Keep them in a note as you go:
 ```
 TELEGRAM_BOT_TOKEN = ?
 GEMINI_API_KEY     = ?
-GCS_BUCKET         = ?
 WEBHOOK_SECRET     = ?   (you invent this one)
 ADMIN_USER_IDS     = ?
 RENDER_URL         = ?   (you get this in step 5)
@@ -103,10 +112,12 @@ RENDER_URL         = ?   (you get this in step 5)
    Cambodia, e.g. `asia-southeast1`. Click **Enable**.
    - Production mode blocks direct access from browsers and phones. The bot uses
      a service account, so it is unaffected. Leave the security rules alone.
-4. **Storage:** open **Build → Storage** → **Get started**. Accept the defaults
-   and the same location.
-   - It shows a bucket name like `sb-groupchat-bot.firebasestorage.app`. That is
-     your **`GCS_BUCKET`**. Copy it exactly, with no `gs://` prefix.
+4. **Ignore Firebase Storage.** You do not need it, and you should not enable
+   it. Since September 2024 it requires the paid Blaze plan, and linking a
+   billing account to this project would also drop it off the Gemini API free
+   tier. Stay on the **Spark (no cost)** plan.
+   - This bot stores no audio. Voice notes already live on Telegram's servers,
+     and the bot keeps only a reference to them.
 5. **Service account key:** click the gear icon (top left) → **Project
    settings** → **Service accounts** tab → **Generate new private key** →
    **Generate key**. A `.json` file downloads.
@@ -152,7 +163,6 @@ RENDER_URL         = ?   (you get this in step 5)
    | --- | --- |
    | `TELEGRAM_BOT_TOKEN` | from step 1 |
    | `GEMINI_API_KEY` | from step 4 |
-   | `GCS_BUCKET` | from step 3 |
    | `WEBHOOK_SECRET` | invent a long random string, e.g. 30 mixed characters, no spaces or `/` |
    | `ADMIN_USER_IDS` | from step 2 |
 
@@ -279,6 +289,9 @@ That person hasn't started a private chat with the bot. See step 9.
 
 ## Voice notes show `[voice transcription failed]`
 
+- **Was the voice message deleted from the chat?** The bot fetches the audio from
+  Telegram on demand, so a deleted note can no longer be transcribed. This is the
+  most common cause and there's no fix — the audio is gone.
 - Check `GEMINI_API_KEY` in Render.
 - Check the Render logs for the real error.
 - If it says the model was not found, Google has retired it. Search for the
@@ -328,7 +341,7 @@ to test on Render.
 ## Design notes for whoever edits this next
 
 - Three code files on purpose. `bot.py` is the only file that touches Telegram
-  or Flask, `firestore_db.py` is the only file that touches Google storage,
+  or Flask, `firestore_db.py` is the only file that touches Firestore,
   `gemini_client.py` is the only file that calls the AI. Don't add a
   handlers/services/repository split for one caller.
 - **Never** replace the shared event loop in `bot.py` with `asyncio.run()` inside

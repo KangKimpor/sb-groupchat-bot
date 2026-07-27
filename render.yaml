@@ -12,8 +12,6 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
-      - key: GCS_BUCKET
-        sync: false
       - key: WEBHOOK_SECRET
         sync: false
       - key: ADMIN_USER_IDS

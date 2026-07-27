@@ -46,9 +46,9 @@ layer.
 - **`bot.py`** — the only file importing `flask` or `telegram`. Flask routes,
   PTB `Application`, every command handler, the silent logging middleware
   (`log_all_messages`), and transcription orchestration.
-- **`firestore_db.py`** — the only file touching Firestore or Firebase Storage.
-  Message logging, group registry, rate limit counters, retention sweep, voice
-  blob upload/download.
+- **`firestore_db.py`** — the only file touching Firestore. Message logging,
+  group registry, rate limit counters, retention sweep. No blob storage; see
+  invariant 7.
 - **`gemini_client.py`** — the only file calling the AI. `ask()`, `summarize()`,
   `transcribe_and_translate()`.
 - **`test_bot.py`** — stdlib `unittest`, Firestore and Gemini stubbed. No pytest
@@ -80,15 +80,24 @@ layer.
    the only range query orders by the same field it filters on (`ts`). Adding a
    query that filters on one field and orders by another needs an index created
    by hand first — avoid it.
-6. **Voice notes go inline, not through the Files API.** The 3-minute cap keeps
-   every request far below the 20MB inline ceiling, so `types.Part.from_bytes`
-   avoids an upload plus cleanup round trip.
+6. **Voice notes go inline to Gemini, not through the Files API.** The 3-minute
+   cap keeps every request far below the 20MB inline ceiling, so
+   `types.Part.from_bytes` avoids an upload plus cleanup round trip.
+7. **Never store audio, and never add Cloud Storage for Firebase.** Since
+   September 2024 it requires the paid **Blaze** plan, and linking a billing
+   account to the project would also drop it off the **Gemini API free tier** —
+   two metered services where there were none. Instead we persist Telegram's
+   `file_id` and fetch the audio back with `bot.get_file(file_id)` at
+   transcription time. Telegram's download URLs expire after an hour, but
+   calling `get_file` again mints a fresh one, so a `file_id` stays usable well
+   past the 10-day retention window. Consequence to keep in mind: if the sender
+   deletes the voice message, transcription fails and returns
+   `[voice transcription failed]`. Already-cached transcripts are unaffected.
 
 ## Voice pipeline
 
-1. **On receipt:** downloaded from Telegram, uploaded to Firebase Storage at
-   `{group_id}/{message_id}.ogg`, logged in Firestore with `transcript: null`.
-   No AI call, no chat message.
+1. **On receipt:** only the Telegram `file_id` is logged in Firestore, with
+   `transcript: null`. No download, no upload, no AI call, no chat message.
 2. **Over 3 minutes** (`MAX_VOICE_SECONDS = 180`): skipped entirely, not stored
    and not logged.
 3. **Transcription is lazy** — only when a `/summary` or `/export` range
@@ -102,8 +111,9 @@ layer.
 
 ## Retention and rate limits
 
-**Retention:** 10 days rolling, for Firestore docs, cached transcripts, Storage
-audio blobs and stale usage counters. Enforced by
+**Retention:** 10 days rolling, for Firestore docs, cached transcripts and stale
+usage counters. There is no audio to purge — we never stored any, and dropping
+the doc drops the `file_id` with it. Enforced by
 `firestore_db.cleanup_old_messages()` via the `/cleanup` route, called daily by
 cron-job.org. Render's own cron needs a paid plan, hence the external trigger.
 
@@ -144,9 +154,11 @@ returns groups the caller is a member of.
 
 Set in the Render dashboard; see `.env.example` and `render.yaml`.
 
-`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, `GCS_BUCKET`, `WEBHOOK_SECRET`,
-`ADMIN_USER_IDS`, `GEMINI_MODEL`, `LOCAL_UTC_OFFSET_HOURS`,
-`GOOGLE_APPLICATION_CREDENTIALS`.
+`TELEGRAM_BOT_TOKEN`, `GEMINI_API_KEY`, `WEBHOOK_SECRET`, `ADMIN_USER_IDS`,
+`GEMINI_MODEL`, `LOCAL_UTC_OFFSET_HOURS`, `GOOGLE_APPLICATION_CREDENTIALS`.
+
+There is deliberately no `GCS_BUCKET`. The Firebase project must stay on the
+no-cost **Spark** plan; see invariant 7.
 
 - `WEBHOOK_SECRET` is embedded in the webhook URL path (`/webhook/<secret>`) and
   required as `?key=` on `/cleanup`, so random traffic can't trigger either.

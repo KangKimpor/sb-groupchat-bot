@@ -193,6 +193,8 @@ class WebhookLoopTest(unittest.TestCase):
         self.url = f"/webhook/{os.environ['WEBHOOK_SECRET']}"
         sent_messages.clear()
         logged_messages.clear()
+        # The dedupe cache is process-wide, so tests would poison each other.
+        bot._seen_updates.clear()
 
     def test_sequential_updates_share_one_loop(self):
         payloads = [
@@ -218,6 +220,30 @@ class WebhookLoopTest(unittest.TestCase):
         self.assertEqual(self.client.get("/cleanup?key=wrong").status_code, 403)
         ok = self.client.get(f"/cleanup?key={os.environ['WEBHOOK_SECRET']}")
         self.assertEqual(ok.status_code, 200)
+
+    def test_duplicate_delivery_is_processed_once(self):
+        """Telegram redelivers unacknowledged updates. Doing the work twice
+        would mean a double DM and a double Gemini bill."""
+        payload = make_update(900, "/help")
+        self.assertEqual(self.client.post(self.url, json=payload).status_code, 200)
+        first = len(sent_messages)
+        self.assertEqual(self.client.post(self.url, json=payload).status_code, 200)
+        self.assertEqual(len(sent_messages), first, "duplicate was processed again")
+
+    def test_garbage_body_still_returns_200(self):
+        """A non-2xx would make Telegram retry the same bad payload forever."""
+        self.assertEqual(
+            self.client.post(self.url, data=b"not json at all").status_code, 200
+        )
+        self.assertEqual(self.client.post(self.url, json=[1, 2, 3]).status_code, 200)
+
+    def test_handler_explosion_still_returns_200(self):
+        def boom(*a, **k):
+            raise RuntimeError("gemini exploded")
+
+        with mock.patch.object(fake_gemini, "ask", boom):
+            response = self.client.post(self.url, json=make_update(901, "/ask hello"))
+        self.assertEqual(response.status_code, 200)
 
 
 class TranscriptParsingTest(unittest.TestCase):

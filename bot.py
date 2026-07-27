@@ -19,6 +19,7 @@ fetched from Telegram and transcribed strictly on demand, when a /summary or
 """
 
 import asyncio
+import hmac
 import logging
 import os
 import re
@@ -43,10 +44,34 @@ WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 # Voice notes longer than this are not stored or logged at all.
 MAX_VOICE_SECONDS = 180
 
-# Used only to decide where "today" starts. Rate limits stay on UTC midnight.
-# Singbuild sites run on Cambodia time (UTC+7), so a UTC "today" would silently
-# drop every message sent before 7am local.
-LOCAL_OFFSET = timedelta(hours=float(os.environ.get("LOCAL_UTC_OFFSET_HOURS", "7")))
+def _local_offset():
+    """Used only to decide where "today" starts. Rate limits stay on UTC
+    midnight. Singbuild sites run on Cambodia time (UTC+7), so a UTC "today"
+    would silently drop every message sent before 7am local.
+
+    Falls back rather than raising: a typo in this env var should not take the
+    whole bot down at import.
+    """
+    raw = os.environ.get("LOCAL_UTC_OFFSET_HOURS", "7")
+    try:
+        return timedelta(hours=float(raw))
+    except (TypeError, ValueError):
+        log.warning(
+            "LOCAL_UTC_OFFSET_HOURS=%r is not a number; falling back to 7 (Cambodia)",
+            raw,
+        )
+        return timedelta(hours=7)
+
+
+LOCAL_OFFSET = _local_offset()
+
+# Cap on how many *new* transcriptions one /summary or /export may trigger.
+# Cached transcripts don't count. Without this, a range holding thirty new voice
+# notes would keep the webhook request open for minutes; Telegram gives up and
+# redelivers the update, so the work and the Gemini spend happen twice. Anything
+# skipped is picked up by running the command again, since each successful
+# transcription is cached.
+MAX_VOICE_PER_REQUEST = 6
 
 TELEGRAM_MAX_CHARS = 3900  # real ceiling is 4096; leave room for formatting
 
@@ -241,8 +266,14 @@ async def _transcribe_voice_msg(bot, group_id, message, requester_id):
 
 
 async def _render_conversation(bot, group_id, messages, requester_id):
-    """Messages -> flat text log, transcribing any voice notes in range."""
+    """Messages -> flat text log, transcribing any voice notes in range.
+
+    At most MAX_VOICE_PER_REQUEST *new* transcriptions happen per call, to keep
+    the webhook request inside Telegram's patience. Already-cached transcripts
+    are free and unlimited.
+    """
     lines = []
+    fetched = 0
     for msg in messages:
         ts = msg.get("ts")
         stamp = (
@@ -252,9 +283,18 @@ async def _render_conversation(bot, group_id, messages, requester_id):
         )
         who = msg.get("username") or str(msg.get("user_id"))
         if msg.get("kind") == "voice":
-            body = "(voice) " + await _transcribe_voice_msg(
-                bot, group_id, msg, requester_id
-            )
+            if msg.get("transcript"):
+                body = "(voice) " + msg["transcript"]
+            elif fetched >= MAX_VOICE_PER_REQUEST:
+                body = (
+                    "(voice) [not transcribed yet - run this command again to "
+                    "pick up the rest]"
+                )
+            else:
+                fetched += 1
+                body = "(voice) " + await _transcribe_voice_msg(
+                    bot, group_id, msg, requester_id
+                )
         else:
             body = msg.get("text") or ""
         if body.strip():
@@ -457,8 +497,11 @@ async def cmd_setalias(update, context):
 
 
 async def log_all_messages(update, context):
-    """Store every non-command group message. Voice notes are downloaded and
-    parked in Storage; no AI call happens here."""
+    """Store every non-command group message.
+
+    For voice notes this records only Telegram's file_id -- no download, no
+    upload, no AI call. One Firestore write and we're done.
+    """
     message = update.effective_message
     chat = update.effective_chat
     if message is None or chat is None or not _is_group(update):
@@ -528,6 +571,21 @@ tg_app.add_handler(
     group=1,
 )
 
+
+async def on_error(update, context):
+    """Without this PTB only emits a terse 'No error handlers are registered'
+    line, which hides the actual traceback in the Render logs."""
+    update_id = getattr(update, "update_id", None)
+    log.error(
+        "unhandled error while processing update %s: %s",
+        update_id,
+        context.error,
+        exc_info=context.error,
+    )
+
+
+tg_app.add_error_handler(on_error)
+
 # ONE event loop, created once, reused for every webhook call.
 #
 # Do NOT replace this with asyncio.run() inside the route. asyncio.run() tears
@@ -540,6 +598,24 @@ _loop.run_until_complete(tg_app.initialize())
 
 app = Flask(__name__)
 
+# Telegram redelivers any update we don't acknowledge, and can deliver the same
+# update twice on its own. Without this, one duplicate /summary means a second
+# Gemini bill and a second DM. In-process only, which is enough: retries arrive
+# within seconds, and a Render restart legitimately starts a clean slate.
+_MAX_SEEN_UPDATES = 1000
+_seen_updates = {}
+
+
+def _already_processed(update_id):
+    if update_id is None:
+        return False
+    if update_id in _seen_updates:
+        return True
+    _seen_updates[update_id] = True
+    while len(_seen_updates) > _MAX_SEEN_UPDATES:
+        _seen_updates.pop(next(iter(_seen_updates)))
+    return False
+
 
 @app.route("/")
 def health():
@@ -548,16 +624,44 @@ def health():
 
 @app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), tg_app.bot)
-    _loop.run_until_complete(tg_app.process_update(update))
+    """Always answers 200, deliberately.
+
+    Any non-2xx tells Telegram to redeliver the same update, so a bug that
+    raises here would turn into an endless retry loop, each pass burning quota
+    and re-sending DMs. Failures are logged and swallowed instead.
+    """
+    payload = request.get_json(force=True, silent=True)
+    if not isinstance(payload, dict):
+        log.warning("webhook received a body that isn't a JSON object; ignoring")
+        return "ok", 200
+
+    update_id = payload.get("update_id")
+    if _already_processed(update_id):
+        log.info("ignoring duplicate delivery of update %s", update_id)
+        return "ok", 200
+
+    try:
+        update = Update.de_json(payload, tg_app.bot)
+        if update is None:
+            log.info("update %s is a type this bot doesn't handle", update_id)
+            return "ok", 200
+        _loop.run_until_complete(tg_app.process_update(update))
+    except Exception as exc:
+        log.exception("failed to process update %s: %s", update_id, exc)
     return "ok", 200
 
 
 @app.route("/cleanup")
 def cleanup():
-    if request.args.get("key") != WEBHOOK_SECRET:
+    # compare_digest rather than != so the comparison doesn't leak the secret
+    # one character at a time through response timing.
+    if not hmac.compare_digest(request.args.get("key", ""), WEBHOOK_SECRET):
         return "forbidden", 403
-    deleted = db.cleanup_old_messages()
+    try:
+        deleted = db.cleanup_old_messages()
+    except Exception as exc:
+        log.exception("cleanup failed: %s", exc)
+        return "cleanup failed, see logs", 500
     log.info("cleanup removed %s documents", deleted)
     return f"deleted {deleted}", 200
 

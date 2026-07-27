@@ -83,7 +83,14 @@ layer.
 6. **Voice notes go inline to Gemini, not through the Files API.** The 3-minute
    cap keeps every request far below the 20MB inline ceiling, so
    `types.Part.from_bytes` avoids an upload plus cleanup round trip.
-7. **Never store audio, and never add Cloud Storage for Firebase.** Since
+7. **The webhook route always returns 200, and dedupes by `update_id`.** Any
+   non-2xx tells Telegram to redeliver the same update, so an exception that
+   escapes the route becomes an endless retry loop, each pass re-sending DMs and
+   re-billing Gemini. Failures are logged and swallowed instead. Don't "improve"
+   this by propagating errors. The `_seen_updates` cache is in-process only,
+   which is sufficient: retries arrive within seconds, and a Render restart
+   legitimately starts clean.
+8. **Never store audio, and never add Cloud Storage for Firebase.** Since
    September 2024 it requires the paid **Blaze** plan, and linking a billing
    account to the project would also drop it off the **Gemini API free tier** —
    two metered services where there were none. Instead we persist Telegram's
@@ -129,9 +136,17 @@ everything):
 | voice transcription, whole group | 200 |
 
 Both voice caps are enforced inside `_transcribe_voice_msg`, before any Gemini
-call. The group cap is checked first, then the per-user quota is consumed. The
-group counter only increments **after** a successful call, so a Gemini outage
-doesn't burn the group's day. These caps exist specifically to stay inside the
+call *or Telegram download*. The group cap is checked first, then the per-user
+quota is consumed. The group counter only increments **after** a successful
+call, so a Gemini outage doesn't burn the group's day.
+
+Separately, `MAX_VOICE_PER_REQUEST` (6) bounds how many **new** transcriptions a
+single `/summary` or `/export` may trigger. This is a latency guard, not a quota:
+without it a range holding thirty new voice notes keeps the webhook request open
+for minutes, Telegram gives up waiting and redelivers the update, and the work
+plus the Gemini spend happen twice. Skipped notes are labelled in the output and
+picked up by running the command again, since each success is cached. Cached
+transcripts are free and never counted against it. These caps exist specifically to stay inside the
 Gemini free tier — the `/summary` and `/export` limits alone would not stop one
 call whose range happens to contain fifty voice notes.
 
@@ -158,7 +173,13 @@ Set in the Render dashboard; see `.env.example` and `render.yaml`.
 `GEMINI_MODEL`, `LOCAL_UTC_OFFSET_HOURS`, `GOOGLE_APPLICATION_CREDENTIALS`.
 
 There is deliberately no `GCS_BUCKET`. The Firebase project must stay on the
-no-cost **Spark** plan; see invariant 7.
+no-cost **Spark** plan; see invariant 8.
+
+Both `ADMIN_USER_IDS` and `LOCAL_UTC_OFFSET_HOURS` are parsed defensively at
+import: a bad entry logs a warning and is skipped rather than raising. A
+`ValueError` at import time on Render surfaces as a boot loop whose traceback
+looks nothing like "you typo'd an env var", so the few extra lines earn their
+keep. Don't tighten these back into bare `int()`/`float()` calls.
 
 - `WEBHOOK_SECRET` is embedded in the webhook URL path (`/webhook/<secret>`) and
   required as `?key=` on `/cleanup`, so random traffic can't trigger either.

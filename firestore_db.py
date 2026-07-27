@@ -21,10 +21,13 @@ That needs no composite index. Do not add a query that filters on one field and
 orders by a different one without creating the index first.
 """
 
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 
 from google.cloud import firestore
+
+_log = logging.getLogger("sb-groupchat-bot.db")
 
 # --- policy ---------------------------------------------------------------
 
@@ -42,11 +45,27 @@ DAILY_LIMITS = {
 # Gemini free-tier quota for every other Singbuild project.
 GROUP_VOICE_DAILY_LIMIT = 200
 
-_ADMIN_IDS = {
-    int(part)
-    for part in os.environ.get("ADMIN_USER_IDS", "").replace(" ", "").split(",")
-    if part
-}
+def _parse_admin_ids(raw):
+    """Tolerant on purpose. A typo like `@por` or `123,,456` in a Render env var
+    must not crash the whole service at import with a bare ValueError -- that
+    failure looks nothing like its cause. Skip the bad entry, log it, carry on.
+    """
+    ids = set()
+    for part in (raw or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            _log.warning(
+                "ADMIN_USER_IDS: ignoring %r, not a numeric Telegram user id "
+                "(get yours from @userinfobot)",
+                part,
+            )
+    return ids
+
+
+_ADMIN_IDS = _parse_admin_ids(os.environ.get("ADMIN_USER_IDS", ""))
 
 # --- client (lazy so importing this module never needs credentials) --------
 

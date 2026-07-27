@@ -58,6 +58,12 @@ One consequence: if someone **deletes** their voice message in Telegram, a later
 summary can't transcribe it and will show `[voice transcription failed]`. Notes
 already transcribed are unaffected, since the text is saved.
 
+A single `/summary` or `/export` transcribes at most **6 new** voice notes, to
+keep Telegram from timing out and asking twice. Any beyond that are marked
+`[not transcribed yet - run this command again to pick up the rest]`. Running the
+command again continues where it left off, because finished transcripts are
+saved. Notes already transcribed don't count toward the 6.
+
 ## Data retention
 
 Messages and transcripts are deleted after **10 days** by a daily cleanup job

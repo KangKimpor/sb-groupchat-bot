@@ -10,6 +10,11 @@ it transcribes and translates to English.
 Everything runs on genuinely free tiers, with no billing account anywhere:
 Render + Firebase Firestore + the Gemini API.
 
+**Installing it for the first time? Follow [INSTALL.md](INSTALL.md).** It is a
+self-contained, step-by-step guide written for someone who has never deployed
+anything. This file is the reference: what the bot does, what the limits are,
+and what to check when something misbehaves.
+
 ## Commands
 
 | Command | What it does |
@@ -26,8 +31,8 @@ need to name the group. From a private chat you do: `/summary uvp2 week`.
 
 ## Daily limits
 
-Per person, per day, resetting at midnight UTC. Anyone listed in
-`ADMIN_USER_IDS` has no limits.
+Per person, per day, **across all groups**, resetting at midnight UTC. Anyone
+listed in `ADMIN_USER_IDS` has no limits.
 
 | | Limit |
 | --- | --- |
@@ -39,6 +44,10 @@ Per person, per day, resetting at midnight UTC. Anyone listed in
 
 These exist to stay inside the Gemini free tier. Voice notes are only ever
 transcribed once — the text is saved, so the same note never costs quota twice.
+
+If a request fails in a way that never reached you — Gemini erroring on `/ask`,
+or a `/summary` that couldn't be delivered because you never pressed Start — the
+quota unit is handed back.
 
 ## How voice notes work
 
@@ -58,203 +67,26 @@ One consequence: if someone **deletes** their voice message in Telegram, a later
 summary can't transcribe it and will show `[voice transcription failed]`. Notes
 already transcribed are unaffected, since the text is saved.
 
+## Who can read what
+
+Recaps and exports are only ever sent to the person who asked, and only for a
+group they are currently in. Membership is confirmed against Telegram at the
+moment of the request, so **removing someone from a project group immediately
+removes their access to that group's history**, including from a private chat.
+
+For that revocation to be recorded promptly, the webhook must be registered with
+`chat_member` in its `allowed_updates` list — INSTALL.md step 6 does this. Even
+without it, the live check still refuses the request.
+
 ## Data retention
 
 Messages and transcripts are deleted after **10 days** by a daily cleanup job
-(step 7 below). After that the bot has no record of the conversation at all.
+(INSTALL.md step 7). After that the bot has no record of the conversation at all.
 
----
-
-# Setup guide
-
-Assumes no prior experience. Follow in order. Budget about 45 minutes.
-
-You will collect six values along the way. Keep them in a note as you go:
-
-```
-TELEGRAM_BOT_TOKEN = ?
-GEMINI_API_KEY     = ?
-WEBHOOK_SECRET     = ?   (you invent this one)
-ADMIN_USER_IDS     = ?
-RENDER_URL         = ?   (you get this in step 5)
-```
-
-## Step 1 — Create the Telegram bot
-
-1. In Telegram, search for **@BotFather** and open the chat. Press **Start**.
-2. Send `/newbot`.
-3. For the display name, send: `SingBuildGroupChatBot`
-4. For the username, send: `SingBuildGroupChatBot`
-   - Usernames are globally unique. If it's taken, try
-     `SingBuildGroupChat_bot` or `SingBuildGroupChatBot_bot`. Note down whatever
-     you actually get — you'll need it later to open a private chat.
-5. BotFather replies with a token like `8123456789:AAF...`. That is your
-   **`TELEGRAM_BOT_TOKEN`**. Treat it like a password.
-6. **Important — turn off privacy mode.** By default a bot cannot see normal
-   group messages, only commands, so summaries and exports would come back
-   empty. Send `/setprivacy` to BotFather, pick your bot, then choose
-   **Disable**. It should confirm privacy mode is disabled.
-
-## Step 2 — Get your own Telegram user ID
-
-1. Search for **@userinfobot** in Telegram and press Start.
-2. It replies with your numeric ID, e.g. `123456789`. That is your
-   **`ADMIN_USER_IDS`**.
-3. For several admins, separate with commas and no spaces: `123456789,987654321`.
-
-## Step 3 — Create the Firebase project
-
-1. Go to <https://console.firebase.google.com> and sign in with a Google account.
-2. Click **Create a project**. Name it `sb-groupchat-bot`. Google Analytics is
-   not needed — turn it off. Click **Create project**.
-3. **Firestore:** in the left menu open **Build → Firestore Database** →
-   **Create database**. Choose **Production mode**. Pick a location near
-   Cambodia, e.g. `asia-southeast1`. Click **Enable**.
-   - Production mode blocks direct access from browsers and phones. The bot uses
-     a service account, so it is unaffected. Leave the security rules alone.
-4. **Ignore Firebase Storage.** You do not need it, and you should not enable
-   it. Since September 2024 it requires the paid Blaze plan, and linking a
-   billing account to this project would also drop it off the Gemini API free
-   tier. Stay on the **Spark (no cost)** plan.
-   - This bot stores no audio. Voice notes already live on Telegram's servers,
-     and the bot keeps only a reference to them.
-5. **Service account key:** click the gear icon (top left) → **Project
-   settings** → **Service accounts** tab → **Generate new private key** →
-   **Generate key**. A `.json` file downloads.
-   - This file is a master key to your database. Never commit it to GitHub,
-     never send it over chat. Rename it to `gcp-service-account.json`.
-
-## Step 4 — Get a Gemini API key
-
-1. Go to <https://aistudio.google.com/apikey> and sign in.
-2. Click **Create API key**, and choose the Firebase project from step 3.
-3. Copy the key. That is your **`GEMINI_API_KEY`**.
-
-## Step 5 — Put the code on GitHub, then deploy to Render
-
-### 5a. GitHub
-
-1. Go to <https://github.com/new>. Repository name: `sb-groupchat-bot`. Set it to
-   **Private**. Create it.
-2. Upload these files (drag and drop works, via **Add file → Upload files**):
-   `bot.py`, `firestore_db.py`, `gemini_client.py`, `requirements.txt`,
-   `render.yaml`, `.gitignore`, `.env.example`, `README.md`, `test_bot.py`.
-3. **Do not upload `gcp-service-account.json`.** It goes to Render directly in
-   step 5b.
-
-### 5b. Render
-
-1. Go to <https://render.com> and sign up with your GitHub account.
-2. Click **New → Blueprint**, connect GitHub, and pick `sb-groupchat-bot`.
-   - Use **Blueprint**, not "Web Service". Blueprint is the option that actually
-     reads `render.yaml`, so the plan, build command and start command configure
-     themselves.
-   - If you'd rather create it as **New → Web Service** by hand, set
-     **Build Command** to `pip install -r requirements.txt`, **Start Command** to
-     `python bot.py`, instance type **Free**, and then also add the three
-     variables `GEMINI_MODEL=gemini-3.5-flash-lite`,
-     `LOCAL_UTC_OFFSET_HOURS=7` and
-     `GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/gcp-service-account.json`
-     alongside the table below.
-3. Render prompts for the values marked `sync: false` in `render.yaml`. Fill them
-   in now, or add them afterwards under the service's **Environment** tab:
-
-   | Key | Value |
-   | --- | --- |
-   | `TELEGRAM_BOT_TOKEN` | from step 1 |
-   | `GEMINI_API_KEY` | from step 4 |
-   | `WEBHOOK_SECRET` | invent a long random string, e.g. 30 mixed characters, no spaces or `/` |
-   | `ADMIN_USER_IDS` | from step 2 |
-
-   `GEMINI_MODEL`, `LOCAL_UTC_OFFSET_HOURS` and
-   `GOOGLE_APPLICATION_CREDENTIALS` already have correct values from
-   `render.yaml`. Leave them.
-
-4. Confirm and let it deploy (**Apply**, or **Create Web Service** if you went the
-   manual route). The first build takes a few minutes.
-5. Now add the service account key. Open the service → **Environment** →
-   **Secret Files** → **Add Secret File**:
-   - Filename: `gcp-service-account.json` (exactly this — `render.yaml` points
-     `GOOGLE_APPLICATION_CREDENTIALS` at `/etc/secrets/gcp-service-account.json`)
-   - Contents: open the JSON file from step 3 in a text editor, copy everything,
-     paste it in. Save.
-   - Saving a secret file redeploys the service. That's expected — the first
-     deploy will have failed to reach Firestore without this, which is fine.
-6. Wait for the status to read **Live**, then copy the URL at the top, e.g.
-   `https://sb-groupchat-bot.onrender.com`. That is your **`RENDER_URL`**.
-7. Check it: open `RENDER_URL` in a browser. It should show
-   `sb-groupchat-bot ok`. If it doesn't, open **Logs** and look at the first few
-   lines for a missing variable.
-
-## Step 6 — Point Telegram at Render
-
-Telegram needs to know where to deliver messages. This is a one-time step.
-
-Paste this into your browser's address bar, replacing the three parts, then
-press Enter:
-
-```
-https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=<RENDER_URL>/webhook/<WEBHOOK_SECRET>
-```
-
-Worked example (with fake values):
-
-```
-https://api.telegram.org/bot8123456789:AAFxxxx/setWebhook?url=https://sb-groupchat-bot.onrender.com/webhook/my-long-random-secret
-```
-
-You should see `{"ok":true,"result":true,"description":"Webhook was set"}`.
-
-Note there is no `<` or `>` in the final URL, and the token keeps its colon.
-
-## Step 7 — Set up the daily cleanup
-
-Render's free plan has no scheduler, so use a free external one.
-
-1. Go to <https://cron-job.org> and create a free account.
-2. Click **Create cronjob**.
-3. URL: `<RENDER_URL>/cleanup?key=<WEBHOOK_SECRET>`
-4. Schedule: every day at a quiet hour, e.g. 19:00 (that's 02:00 in Cambodia).
-5. Save and press **Test run** once. It should return `deleted 0`.
-
-## Step 8 — Add the bot to each project group
-
-Do this for every Singbuild group.
-
-1. Open the group in Telegram → group name → **Add members** → search your bot's
-   username → add it.
-2. **Make it an admin.** Group name → **Administrators** → **Add
-   administrator** → pick the bot. It doesn't need any special powers; admin
-   status just makes message visibility reliable. Leave the defaults.
-3. In the group, send a short name for it:
-
-   ```
-   /setalias uvp2
-   ```
-
-   The bot confirms. Now anyone in that group can message the bot privately and
-   run `/summary uvp2 week`.
-4. Repeat per group with a different alias each time — e.g. `uvp2`, `kfk2`,
-   `norea`.
-
-## Step 9 — Tell the team one thing
-
-For a private recap to reach someone, **they must have started a private chat
-with the bot at least once**. Telegram forbids bots from messaging people first.
-
-Ask everyone to search the bot's username, open it, and press **Start**. One
-time, and that's it.
-
-## Step 10 — Check it works
-
-1. In a group, send a few normal messages.
-2. Send `/ask what is the standard curing time for concrete` — it answers in the
-   group.
-3. Send a short voice note. Nothing visible happens. That's correct.
-4. Send `/summary`. The group gets "Working on it", and the recap arrives in your
-   private chat with the voice note included as text.
-5. Send `/export week` — a `.txt` file arrives privately.
-6. Send `/limits` — shows your remaining quota.
+One thing to know before putting a client-confidential group on this: on the
+Gemini API **free tier**, Google states that content may be used to improve
+their products. If that isn't acceptable for a particular project, that project
+shouldn't use this bot on the free tier.
 
 ---
 
@@ -262,30 +94,47 @@ time, and that's it.
 
 ## The first message after a quiet spell is slow
 
-Render's free tier puts the service to sleep after 15 minutes of no traffic. The
-next Telegram message wakes it, which takes a few seconds. Nothing is lost, it's
-just briefly slow. Normal.
+Render's free tier puts the service to sleep after 15 minutes of no traffic, and
+waking it takes about a minute. The next Telegram message wakes it. Telegram
+re-sends anything it thinks failed and the bot ignores duplicates, so nothing is
+lost or doubled — it's just briefly slow. Normal.
+
+Don't "fix" this with a keep-alive ping. Render grants 750 free instance hours a
+month per workspace and a 31-day month is 744 hours, so keeping the service
+permanently awake consumes essentially the entire allowance and risks suspending
+everything until the next month.
 
 ## The bot does nothing at all
 
 1. Check the webhook. Open in a browser:
    `https://api.telegram.org/bot<TOKEN>/getWebhookInfo`
-   - `"url"` must exactly match your Render URL plus `/webhook/<secret>`.
+   - `"url"` must exactly match your Render URL plus `/webhook/<WEBHOOK_SECRET>`.
    - Look at `last_error_message`. If it mentions a timeout, hit your Render URL
      once in a browser to wake the service, then send another message.
-2. Check Render → your service → **Logs** for errors on startup. A missing env
+2. **If you set `WEBHOOK_HEADER_SECRET`,** the `setWebhook` call must have
+   included `&secret_token=<that same value>`. If it didn't, every update is
+   rejected with 403 and the bot looks dead. Either re-run setWebhook with the
+   token, or clear `WEBHOOK_HEADER_SECRET` in Render.
+3. Check Render → your service → **Logs** for errors on startup. A missing env
    var shows up as `KeyError` in the first few lines.
-3. Confirm the service is **Live**, not **Failed** or **Suspended**.
+4. Confirm the service is **Live**, not **Failed** or **Suspended**.
 
 ## Commands work but `/summary` and `/export` come back empty
 
-Privacy mode is still on, so the bot never saw the normal messages. Redo step
-1.6 (`/setprivacy` → Disable), then send some new messages. Only messages sent
-*after* the fix are recorded.
+Privacy mode is still on, so the bot never saw the normal messages. Redo
+INSTALL.md step 1.6 (`/setprivacy` → Disable), then send some new messages. Only
+messages sent *after* the fix are recorded.
 
 ## "I couldn't message you privately"
 
-That person hasn't started a private chat with the bot. See step 9.
+That person hasn't started a private chat with the bot. See INSTALL.md step 9.
+Their quota is refunded, so they can retry once that's sorted.
+
+## "I don't know a group called 'x' that you're a member of"
+
+Either the alias doesn't exist, or the caller isn't in that group any more. The
+message is deliberately identical for both so aliases can't be guessed. Check
+with `/setalias` inside the group, and check the person is still a member.
 
 ## Voice notes show `[voice transcription failed]`
 
@@ -293,7 +142,10 @@ That person hasn't started a private chat with the bot. See step 9.
   Telegram on demand, so a deleted note can no longer be transcribed. This is the
   most common cause and there's no fix — the audio is gone.
 - Check `GEMINI_API_KEY` in Render.
-- Check the Render logs for the real error.
+- Check the Render logs. Rate limits and 5xx errors are retried automatically
+  three times with backoff, and each attempt is logged, so a burst of
+  `Gemini call failed ... retrying` lines means you're brushing the free tier's
+  per-minute ceiling. Raise `GEMINI_MIN_INTERVAL_SECONDS`.
 - If it says the model was not found, Google has retired it. Search for the
   current Gemini flash model name and update the `GEMINI_MODEL` env var in
   Render. No code change needed — that's why it's a variable.
@@ -309,29 +161,75 @@ Anything over 3 minutes is skipped on purpose, to stay inside the free tiers.
 Ask for shorter notes, or raise `MAX_VOICE_SECONDS` in `bot.py` knowing it costs
 more quota.
 
+## A summary says "only the most recent 2000 messages"
+
+`MAX_MESSAGES_PER_REQUEST` capped it. The cap keeps the newest messages and
+exists so one busy week can't exhaust the 512MB instance, the Gemini token
+budget, or Firestore's 50,000 free reads a day. Raise or lower it in Render.
+
 ## "today" looks like it covers the wrong hours
 
 `LOCAL_UTC_OFFSET_HOURS` in Render decides when "today" starts. It ships as `7`
 for Cambodia. Daily quotas always reset at midnight UTC regardless.
 
+## Could this ever cost money?
+
+Not without you choosing to make it so. No payment method is attached to Render,
+Firebase or the Gemini API, so every limit in this stack fails by refusing work,
+not by billing:
+
+- **Render** suspends free services rather than charging.
+- **Firestore on Spark** returns errors once a daily quota is spent, and resets.
+- **Gemini free tier** returns 429s, which the bot retries and then reports.
+
+Two things would break that, and both are called out in the code comments:
+enabling **Cloud Storage for Firebase** (needs the paid Blaze plan) or attaching
+a billing account to the Firebase project (which also drops the Gemini API off
+the free tier).
+
 ## Running the tests
 
-```bash
-pip install -r requirements.txt
-python3 -m unittest test_bot.py -v
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m unittest test_bot -v
 ```
 
-No credentials needed — Firestore and Gemini are stubbed. The important test
-pushes several webhook requests through in one process, which is what catches
-event-loop regressions.
+On macOS or Linux:
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+./.venv/bin/python -m unittest test_bot -v
+```
+
+50 tests, no credentials needed — Firestore and Gemini are stubbed. The
+important ones push webhook requests through in a single process, which is what
+catches event-loop regressions and slow-ACK regressions.
 
 ## Running locally
 
+PowerShell:
+
+```powershell
+Copy-Item .env.example .env      # then fill in the real values
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Get-Content .env | Where-Object { $_ -match '^\s*[^#].*=' } | ForEach-Object {
+  $name, $value = $_ -split '=', 2
+  [Environment]::SetEnvironmentVariable($name.Trim(), $value.Trim(), 'Process')
+}
+.\.venv\Scripts\python.exe bot.py
+```
+
+bash:
+
 ```bash
-cp .env.example .env          # then fill in the real values
-pip install -r requirements.txt
+cp .env.example .env             # then fill in the real values
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
 set -a && source .env && set +a
-python3 bot.py
+./.venv/bin/python bot.py
 ```
 
 Telegram needs a public HTTPS URL, so local runs can't receive real messages
@@ -349,11 +247,24 @@ to test on Render.
   python-telegram-bot binds internals to the loop it was initialised on. It
   fails on the *second* message the bot receives, not the first, so it looks
   fine in casual testing.
-- The Flask server is single-threaded deliberately, because that shared loop is
-  not thread-safe. Adding gunicorn or `threaded=True` means switching to
-  `asyncio.run_coroutine_threadsafe`.
+- **The webhook must ACK before doing the work.** Telegram gives a webhook about
+  a minute and re-delivers anything slower. Processing a twenty-voice-note
+  summary inline got it replayed: quota charged twice, DM sent twice, and every
+  other group blocked meanwhile. The route parses, dedupes on `update_id`, hands
+  the coroutine to the loop thread and returns 200.
+- Flask is single-threaded and must only ever reach the loop through
+  `asyncio.run_coroutine_threadsafe`. Update processing already happens off the
+  request thread, so gunicorn or `threaded=True` buys nothing.
+- Wrap blocking Firestore and Gemini calls in `_off_loop`. They're synchronous;
+  awaiting them directly pins the loop and one slow summary stalls every group.
+- Membership is confirmed against Telegram, not against `member_ids`. That list
+  only ever grew, so it could not revoke anything on its own.
+- `log_message` uses `merge=True` and never writes `transcript`. The same
+  `message_id` can arrive twice, and a plain `.set()` wiped cached transcriptions.
 - Every Firestore query here is single-field, and the only range query orders by
   the same field it filters on, so no composite indexes are required. Filtering
   on one field while ordering by another would need an index created by hand.
 - Use the `google-genai` package. `google-generativeai` is dead (end of life
   2025-11-30).
+- The free tier limits requests per *minute*, not just per day. `gemini_client`
+  serialises calls through a pace gate and retries 429s and 5xx with backoff.

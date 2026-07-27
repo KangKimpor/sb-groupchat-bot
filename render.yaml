@@ -12,14 +12,35 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      # Goes in the webhook URL path.
       - key: WEBHOOK_SECRET
         sync: false
+      # Separate secret for /cleanup. That one travels in a query string, so it
+      # ends up in the cron provider's dashboard and in Render's request logs --
+      # which is no place for the webhook path.
+      - key: CLEANUP_KEY
+        sync: false
       - key: ADMIN_USER_IDS
+        sync: false
+      # Optional but recommended. Set a value here AND pass the same value as
+      # secret_token to Telegram's setWebhook; forged POSTs are then rejected
+      # even if the webhook path leaks. Leave blank to skip the check.
+      - key: WEBHOOK_HEADER_SECRET
         sync: false
       # Gemini retires models regularly (gemini-2.0-flash was shut down
       # 2026-06-01). Override here without touching code when that happens.
       - key: GEMINI_MODEL
         value: gemini-3.5-flash-lite
+      # Minimum seconds between Gemini calls. 4s ~= 15 req/min, which keeps a
+      # summary full of voice notes inside the free tier's per-minute ceiling.
+      - key: GEMINI_MIN_INTERVAL_SECONDS
+        value: "4.0"
+      - key: GEMINI_MAX_ATTEMPTS
+        value: "3"
+      # Ceiling on messages pulled by one /summary or /export. Protects both the
+      # 512MB free instance and the Firestore free read quota.
+      - key: MAX_MESSAGES_PER_REQUEST
+        value: "2000"
       # Which timezone "today" means for /summary and /export. Cambodia = 7.
       - key: LOCAL_UTC_OFFSET_HOURS
         value: "7"

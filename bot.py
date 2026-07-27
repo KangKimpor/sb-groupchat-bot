@@ -12,9 +12,10 @@ Commands
     /setalias <name>                       group admins only, enables DM usage
     /help, /start
 
-Non-command group messages are logged silently. Voice notes are downloaded and
-stored on receipt but NOT transcribed then -- transcription is strictly on
-demand, when a /summary or /export range actually touches the note.
+Non-command group messages are logged silently. For voice notes we record only
+Telegram's file_id -- no audio is downloaded or stored on receipt. The audio is
+fetched from Telegram and transcribed strictly on demand, when a /summary or
+/export range actually touches the note.
 """
 
 import asyncio
@@ -196,8 +197,13 @@ async def _resolve_target_group(update, alias):
 # --- voice transcription (lazy, on demand only) ---------------------------
 
 
-def _transcribe_voice_msg(group_id, message, requester_id):
-    """Transcribe one stored voice note, or explain why we didn't.
+async def _transcribe_voice_msg(bot, group_id, message, requester_id):
+    """Transcribe one voice note, or explain why we didn't.
+
+    The audio is fetched from Telegram at this point rather than from our own
+    storage -- we keep only the file_id. Telegram's download links expire after
+    an hour, but calling get_file again with the same file_id mints a fresh one,
+    so the id stays usable for the whole 10-day retention window.
 
     Cached transcripts short-circuit, so a note is never sent to Gemini twice.
     Both the per-user (15/day) and the group-wide (200/day) voice caps are
@@ -208,8 +214,8 @@ def _transcribe_voice_msg(group_id, message, requester_id):
     if cached:
         return cached
 
-    audio_path = message.get("audio_path")
-    if not audio_path:
+    file_id = message.get("file_id")
+    if not file_id:
         return "[voice note: audio unavailable]"
 
     if not db.check_group_voice_limit(group_id):
@@ -218,10 +224,13 @@ def _transcribe_voice_msg(group_id, message, requester_id):
         return "[voice transcription limit reached for today]"
 
     try:
-        audio = db.download_voice(audio_path)
+        tg_file = await bot.get_file(file_id)
+        audio = bytes(await tg_file.download_as_bytearray())
         raw = gemini.transcribe_and_translate(audio)
     except Exception as exc:
-        log.exception("transcription failed for %s: %s", audio_path, exc)
+        # Most likely cause: the sender deleted the voice message, so Telegram
+        # no longer serves it. Nothing to do but say so and move on.
+        log.exception("transcription failed for file_id %s: %s", file_id, exc)
         return "[voice transcription failed]"
 
     text = _extract_transcript_text(raw)
@@ -231,7 +240,7 @@ def _transcribe_voice_msg(group_id, message, requester_id):
     return text
 
 
-def _render_conversation(group_id, messages, requester_id):
+async def _render_conversation(bot, group_id, messages, requester_id):
     """Messages -> flat text log, transcribing any voice notes in range."""
     lines = []
     for msg in messages:
@@ -243,7 +252,9 @@ def _render_conversation(group_id, messages, requester_id):
         )
         who = msg.get("username") or str(msg.get("user_id"))
         if msg.get("kind") == "voice":
-            body = "(voice) " + _transcribe_voice_msg(group_id, msg, requester_id)
+            body = "(voice) " + await _transcribe_voice_msg(
+                bot, group_id, msg, requester_id
+            )
         else:
             body = msg.get("text") or ""
         if body.strip():
@@ -313,7 +324,7 @@ async def cmd_summary(update, context):
             await _tell_dm_failed(update)
         return
 
-    conversation = _render_conversation(group_id, messages, user_id)
+    conversation = await _render_conversation(context.bot, group_id, messages, user_id)
     if not conversation.strip():
         if not await _dm(context, user_id, f"Nothing readable in {group_name} for {label}."):
             await _tell_dm_failed(update)
@@ -357,7 +368,7 @@ async def cmd_export(update, context):
             await _tell_dm_failed(update)
         return
 
-    conversation = _render_conversation(group_id, messages, user_id)
+    conversation = await _render_conversation(context.bot, group_id, messages, user_id)
     body = f"{group_name} - {label}\nExported {db.utcnow():%Y-%m-%d %H:%M} UTC\n\n{conversation}\n"
     safe_name = re.sub(r"[^A-Za-z0-9]+", "-", group_name).strip("-").lower() or "group"
     filename = f"{safe_name}-{period}-{db.utcnow():%Y%m%d}.txt"
@@ -469,16 +480,16 @@ async def log_all_messages(update, context):
             if duration > MAX_VOICE_SECONDS:
                 log.info("skipping %ss voice note in %s", duration, group_id)
                 return
-            tg_file = await context.bot.get_file(message.voice.file_id)
-            audio = bytes(await tg_file.download_as_bytearray())
-            audio_path = db.upload_voice(group_id, message.message_id, audio)
+            # Just record the file_id. Telegram already hosts the audio, so
+            # there is nothing to download or upload until someone actually
+            # asks for a summary or export covering this note.
             db.log_message(
                 group_id,
                 message.message_id,
                 user.id,
                 username,
                 kind="voice",
-                audio_path=audio_path,
+                file_id=message.voice.file_id,
                 duration=duration,
                 ts=message.date or db.utcnow(),
             )

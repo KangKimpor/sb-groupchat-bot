@@ -1,12 +1,19 @@
-"""All persistence for SingBuildGroupChatBot: Firestore + Firebase Storage.
+"""All persistence for SingBuildGroupChatBot: Firestore only.
 
-One module because it is all "talk to Google's storage", and there is exactly
-one caller (bot.py). Layout:
+One module because it is all "talk to Firestore", and there is exactly one
+caller (bot.py). Layout:
 
     groups/{group_id}                    -> name, alias, member_ids[]
-    messages/{group_id}/log/{message_id} -> author, text|transcript, ts, audio_path
+    messages/{group_id}/log/{message_id} -> author, text|transcript, ts, file_id
     usage/{group_id}_{user_id}_{date}    -> per-user daily command counters
     usage/group_{group_id}_{date}        -> group-wide daily voice counter
+
+We deliberately store NO audio. Voice notes are kept only as the Telegram
+`file_id`, and the audio is fetched from Telegram when a transcription is
+actually needed. Cloud Storage for Firebase would have required the Blaze
+plan (billing account) since September 2024, and linking billing would also
+have dropped the project off the Gemini API free tier -- so a second copy of
+audio Telegram already hosts was pure cost for no benefit.
 
 Firestore query note: every query here is a single-field filter, and the only
 one that combines a range with an order_by orders by that *same* field (`ts`).
@@ -17,7 +24,7 @@ orders by a different one without creating the index first.
 import os
 from datetime import datetime, timedelta, timezone
 
-from google.cloud import firestore, storage
+from google.cloud import firestore
 
 # --- policy ---------------------------------------------------------------
 
@@ -41,10 +48,9 @@ _ADMIN_IDS = {
     if part
 }
 
-# --- clients (lazy so importing this module never needs credentials) -------
+# --- client (lazy so importing this module never needs credentials) --------
 
 _db = None
-_bucket = None
 
 
 def db():
@@ -52,13 +58,6 @@ def db():
     if _db is None:
         _db = firestore.Client()
     return _db
-
-
-def bucket():
-    global _bucket
-    if _bucket is None:
-        _bucket = storage.Client().bucket(os.environ["GCS_BUCKET"])
-    return _bucket
 
 
 def utcnow():
@@ -87,12 +86,13 @@ def log_message(
     username,
     text=None,
     kind="text",
-    audio_path=None,
+    file_id=None,
     duration=None,
     ts=None,
 ):
-    """Record one message. Voice notes land here with transcript=None; they are
-    only transcribed later, on demand, by /summary or /export."""
+    """Record one message. Voice notes land here with transcript=None and just a
+    Telegram file_id; they are only fetched and transcribed later, on demand, by
+    /summary or /export."""
     _log_col(group_id).document(str(message_id)).set(
         {
             "message_id": int(message_id),
@@ -100,7 +100,7 @@ def log_message(
             "username": username or str(user_id),
             "kind": kind,
             "text": text,
-            "audio_path": audio_path,
+            "file_id": file_id,
             "duration": duration,
             "transcript": None,
             "ts": ts or utcnow(),
@@ -125,8 +125,12 @@ def get_messages_in_range(group_id, start, end):
 
 
 def cleanup_old_messages():
-    """Drop everything older than RETENTION_DAYS: Firestore docs, the audio
-    blobs they point at, and stale usage counters. Called by the /cleanup route."""
+    """Drop everything older than RETENTION_DAYS: message docs, cached
+    transcripts and stale usage counters. Called by the /cleanup route.
+
+    There is no audio to delete -- we never stored any. Dropping the doc drops
+    the file_id, so the bot loses its reference to the audio too.
+    """
     cutoff = utcnow() - timedelta(days=RETENTION_DAYS)
     deleted = 0
 
@@ -135,12 +139,6 @@ def cleanup_old_messages():
             filter=firestore.FieldFilter("ts", "<", cutoff)
         )
         for doc in stale.stream():
-            audio_path = (doc.to_dict() or {}).get("audio_path")
-            if audio_path:
-                try:
-                    bucket().blob(audio_path).delete()
-                except Exception:  # already gone, or Storage hiccup
-                    pass
             doc.reference.delete()
             deleted += 1
 
@@ -282,16 +280,3 @@ def increment_group_voice(group_id):
     _group_usage_ref(group_id).set(
         {"date": _today(), "voice": firestore.Increment(1)}, merge=True
     )
-
-
-# --- voice blobs ----------------------------------------------------------
-
-
-def upload_voice(group_id, message_id, data):
-    path = f"{group_id}/{message_id}.ogg"
-    bucket().blob(path).upload_from_string(data, content_type="audio/ogg")
-    return path
-
-
-def download_voice(audio_path):
-    return bucket().blob(audio_path).download_as_bytes()

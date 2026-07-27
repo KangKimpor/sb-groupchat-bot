@@ -1,9 +1,11 @@
 # Verified current as of 2026-07-27.
-# python-telegram-bot, flask, google-cloud-storage and google-cloud-firestore
-# were each confirmed as the current release. google-genai moves fast -- check
+# python-telegram-bot, flask and google-cloud-firestore were each confirmed as
+# the current release. google-genai moves fast -- check
 # https://pypi.org/project/google-genai/ before bumping.
+#
+# No google-cloud-storage: we store no audio. Voice notes stay on Telegram's
+# servers and are fetched by file_id when a transcription is needed.
 python-telegram-bot==22.8
 google-cloud-firestore==2.28.0
-google-cloud-storage==3.13.0
 google-genai==2.14.0
 flask==3.1.3

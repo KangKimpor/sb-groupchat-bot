@@ -233,10 +233,9 @@ def _touch_registry(group_id, group_name, user_id):
     with _registry_lock:
         if key in _registry_seen:
             return
+        _registry_seen.add(key)
     db.register_group(group_id, group_name)
     db.add_member(group_id, user_id)
-    with _registry_lock:
-        _registry_seen.add(key)
 
 
 def _forget_member(group_id, user_id):
@@ -799,6 +798,7 @@ tg_app.add_error_handler(on_error)
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
 _loop.run_until_complete(tg_app.initialize())
+_loop.run_until_complete(tg_app.start())
 
 _loop_thread = threading.Thread(
     target=_loop.run_forever, name="ptb-event-loop", daemon=True
